@@ -1201,23 +1201,11 @@ function addToWatchlistFromResearch() {
 
 // -- Yahoo Finance Fetch with Proxy Fallback --
 async function fetchYahoo(symbol) {
-  // Strategy: Yahoo Finance via direct call works from hosted sites (CORS-enabled)
-  // Fallbacks for crypto and edge cases
-  
+  // Strategy: Try multiple working proxies + crypto direct from CoinGecko
   var sym = symbol.toUpperCase();
   var isCrypto = sym.includes('-USD') || sym.includes('-EUR');
 
-  // 1. Try Yahoo Finance directly (works from hosted https sites)
-  try {
-    var yUrl = 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(symbol) + '?interval=1d&range=1d';
-    var yRes = await fetch(yUrl, {signal: AbortSignal.timeout(7000)});
-    if (yRes.ok) {
-      var yData = await yRes.json();
-      if (yData && yData.chart && yData.chart.result && yData.chart.result[0]) return yData;
-    }
-  } catch(e) {}
-
-  // 2. For crypto: try CoinGecko (no CORS issues)
+  // 1. Crypto: CoinGecko direct (no CORS issues)
   if (isCrypto) {
     var cryptoMap = {
       'BTC-USD':'bitcoin','ETH-USD':'ethereum','SOL-USD':'solana','BNB-USD':'binancecoin',
@@ -1232,27 +1220,29 @@ async function fetchYahoo(symbol) {
           var cgData = await cgRes.json();
           var p = cgData.market_data.current_price.usd;
           var prev = p / (1 + cgData.market_data.price_change_percentage_24h / 100);
-          var high52 = cgData.market_data.high_24h.usd;
-          var low52 = cgData.market_data.low_24h.usd;
-          return {chart:{result:[{meta:{regularMarketPrice:p, chartPreviousClose:prev, fiftyTwoWeekHigh:high52, fiftyTwoWeekLow:low52, currency:'USD'}}]}};
+          return {chart:{result:[{meta:{regularMarketPrice:p, chartPreviousClose:prev, fiftyTwoWeekHigh:cgData.market_data.high_24h.usd, fiftyTwoWeekLow:cgData.market_data.low_24h.usd, currency:'USD'}}]}};
         }
       } catch(e) {}
     }
   }
 
-  // 3. Fallback: Yahoo via CORS proxies
+  // 2. Stocks/ETFs via CORS proxies (multiple fallbacks)
   var url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(symbol) + '?interval=1d&range=1d';
   var proxies = [
-    'https://api.allorigins.win/raw?url=',
-    'https://corsproxy.io/?',
-    'https://api.codetabs.com/v1/proxy?quest='
+    function(u) { return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u); },
+    function(u) { return 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u); },
+    function(u) { return 'https://proxy.cors.sh/' + u; },
+    function(u) { return 'https://cors-anywhere.herokuapp.com/' + u; },
+    function(u) { return 'https://api.allorigins.win/get?url=' + encodeURIComponent(u); }
   ];
   for (var i = 0; i < proxies.length; i++) {
     try {
-      var proxyUrl = proxies[i] + encodeURIComponent(url);
-      var res = await fetch(proxyUrl, {signal: AbortSignal.timeout(7000)});
+      var proxyUrl = proxies[i](url);
+      var res = await fetch(proxyUrl, {signal: AbortSignal.timeout(8000), headers: {'x-cors-api-key': 'temp_demo_key'}});
       if (!res.ok) continue;
-      var data = await res.json();
+      var rawData = await res.json();
+      // allorigins.win/get wraps response in {contents: "..."}
+      var data = rawData.contents ? JSON.parse(rawData.contents) : rawData;
       if (data && data.chart && data.chart.result && data.chart.result[0]) return data;
     } catch(e) { continue; }
   }
@@ -1261,24 +1251,55 @@ async function fetchYahoo(symbol) {
 
 // -- Live Prices --
 async function fetchLivePrices() {
-  if (!positions.length||isRefreshing) return;
-  isRefreshing=true;
-  document.getElementById('refresh-status').textContent='Aktualisiere...';
-  var updated=0;
-  for (var i=0;i<positions.length;i++) {
-    var p=positions[i];
-    var match=p.name.match(/\(([^)]+)\)$/);
-    var symbol=match?match[1]:p.name.trim();
-    if (p.type==='Krypto'&&!symbol.includes('-')) symbol=symbol+'-USD';
-    try {
-      var data = await fetchYahoo(symbol);
-      var price = data && data.chart && data.chart.result && data.chart.result[0] && data.chart.result[0].meta ? data.chart.result[0].meta.regularMarketPrice : null;
-      if (price && price > 0) { positions[i].curr = parseFloat(price.toFixed(4)); updated++; }
-    } catch(e) {}
+  if (!positions.length || isRefreshing) return;
+  var apiKey = localStorage.getItem('pfApiKey');
+  if (!apiKey) {
+    document.getElementById('refresh-status').textContent = 'API-Key fehlt';
+    return;
   }
-  save(); renderAll(); isRefreshing=false;
-  var now=new Date().toLocaleTimeString('de-CH',{hour:'2-digit',minute:'2-digit'});
-  document.getElementById('refresh-status').textContent=updated>0?updated+' Kurse · '+now:'Fehler · '+now;
+  isRefreshing = true;
+  document.getElementById('refresh-status').textContent = 'KI sucht aktuelle Kurse...';
+
+  // Build list of positions for AI to research
+  var posList = positions.map(function(p, i) {
+    return (i+1) + '. ' + p.name + ' (' + p.type + ')';
+  }).join('\n');
+
+  var prompt = 'Suche im Web die aktuellen Kurse fuer folgende Positionen und gib sie als JSON-Array zurueck. Verwende Schweizer Franken (CHF) wenn moeglich, sonst die Originalwaehrung. Antworte NUR mit JSON ohne Markdown:\n\n' + posList + '\n\nFormat: [{"index":1,"price":189.50,"currency":"USD"},{"index":2,"price":42800,"currency":"CHF"}]\nWenn ein Kurs nicht gefunden wird: {"index":N,"price":null}';
+
+  try {
+    var data = await callAPI(apiKey, {
+      model: 'claude-opus-4-7',
+      max_tokens: 1500,
+      messages: [{role:'user', content:prompt}]
+    }, true);
+    if (!data || data.error) {
+      isRefreshing = false;
+      document.getElementById('refresh-status').textContent = 'Fehler: ' + (data && data.error ? data.error.message : 'unbekannt');
+      return;
+    }
+    var text = extractText(data).replace(/```json|```/g, '').trim();
+    var prices = extractJSON(text);
+    if (!prices || !Array.isArray(prices)) {
+      isRefreshing = false;
+      document.getElementById('refresh-status').textContent = 'KI-Antwort nicht lesbar';
+      return;
+    }
+    var updated = 0;
+    prices.forEach(function(p) {
+      if (p.price && p.index >= 1 && p.index <= positions.length) {
+        positions[p.index - 1].curr = parseFloat(p.price);
+        updated++;
+      }
+    });
+    save();
+    renderAll();
+    var now = new Date().toLocaleTimeString('de-CH', {hour:'2-digit', minute:'2-digit'});
+    document.getElementById('refresh-status').textContent = updated + ' / ' + positions.length + ' Kurse · ' + now;
+  } catch(e) {
+    document.getElementById('refresh-status').textContent = 'Fehler: ' + e.message;
+  }
+  isRefreshing = false;
 }
 function startAutoRefresh() {
   fetchLivePrices();
