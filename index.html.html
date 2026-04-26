@@ -1201,15 +1201,23 @@ function addToWatchlistFromResearch() {
 
 // -- Yahoo Finance Fetch with Proxy Fallback --
 async function fetchYahoo(symbol) {
-  // Strategy: Try multiple free price APIs in order of reliability
-  // 1. Stooq (no CORS issues, no API key needed) - works for stocks, ETFs, crypto
-  // 2. CoinGecko API (for crypto)
-  // 3. Yahoo Finance via proxies (fallback)
-
+  // Strategy: Yahoo Finance via direct call works from hosted sites (CORS-enabled)
+  // Fallbacks for crypto and edge cases
+  
   var sym = symbol.toUpperCase();
   var isCrypto = sym.includes('-USD') || sym.includes('-EUR');
 
-  // For crypto: try CoinGecko first (no CORS, no key)
+  // 1. Try Yahoo Finance directly (works from hosted https sites)
+  try {
+    var yUrl = 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(symbol) + '?interval=1d&range=1d';
+    var yRes = await fetch(yUrl, {signal: AbortSignal.timeout(7000)});
+    if (yRes.ok) {
+      var yData = await yRes.json();
+      if (yData && yData.chart && yData.chart.result && yData.chart.result[0]) return yData;
+    }
+  } catch(e) {}
+
+  // 2. For crypto: try CoinGecko (no CORS issues)
   if (isCrypto) {
     var cryptoMap = {
       'BTC-USD':'bitcoin','ETH-USD':'ethereum','SOL-USD':'solana','BNB-USD':'binancecoin',
@@ -1224,7 +1232,7 @@ async function fetchYahoo(symbol) {
           var cgData = await cgRes.json();
           var p = cgData.market_data.current_price.usd;
           var prev = p / (1 + cgData.market_data.price_change_percentage_24h / 100);
-          var high52 = cgData.market_data.high_24h.usd; // approx
+          var high52 = cgData.market_data.high_24h.usd;
           var low52 = cgData.market_data.low_24h.usd;
           return {chart:{result:[{meta:{regularMarketPrice:p, chartPreviousClose:prev, fiftyTwoWeekHigh:high52, fiftyTwoWeekLow:low52, currency:'USD'}}]}};
         }
@@ -1232,49 +1240,11 @@ async function fetchYahoo(symbol) {
     }
   }
 
-  // For stocks/ETFs: try Stooq (no CORS)
-  // Stooq uses lowercase tickers with .us suffix for US stocks
-  var stooqSym = sym.toLowerCase();
-  // Map common European tickers
-  var stooqMap = {
-    'nesn':'nestn.ch','novn':'novn.ch','rog':'rog.ch','ubsg':'ubsg.ch','zurn':'zurn.ch',
-    'abbn':'abbn.ch','cfr':'cfr.ch','sika':'sika.ch','lonn':'lonn.ch','pghn':'pghn.ch',
-    'eunl':'eunl.de','sxr8':'sxr8.de','xspu':'xspu.de','vusd':'vusd.uk','csp1':'csp1.de',
-    'vwrl':'vwrl.uk','cndx':'cndx.uk','idem':'idem.uk','iusn':'iusn.de','exw1':'exw1.de',
-    'igln':'igln.uk','iwmo':'iwmo.de','vhyl':'vhyl.uk','dbxs':'dbxs.de','cssmim':'csmim.ch'
-  };
-  if (stooqMap[stooqSym]) {
-    stooqSym = stooqMap[stooqSym];
-  } else if (!stooqSym.includes('.')) {
-    stooqSym = stooqSym + '.us';
-  }
-
-  try {
-    var stooqRes = await fetch('https://stooq.com/q/l/?s=' + stooqSym + '&f=sd2t2ohlcv&h&e=json', {signal: AbortSignal.timeout(7000)});
-    if (stooqRes.ok) {
-      var stooqData = await stooqRes.json();
-      if (stooqData && stooqData.symbols && stooqData.symbols[0]) {
-        var s = stooqData.symbols[0];
-        if (s.close && s.close !== 'N/D') {
-          var price = parseFloat(s.close);
-          var open = parseFloat(s.open) || price;
-          var high = parseFloat(s.high) || price;
-          var low = parseFloat(s.low) || price;
-          // Determine currency from suffix
-          var cur = 'USD';
-          if (stooqSym.endsWith('.ch')) cur = 'CHF';
-          else if (stooqSym.endsWith('.de')) cur = 'EUR';
-          else if (stooqSym.endsWith('.uk')) cur = 'GBP';
-          return {chart:{result:[{meta:{regularMarketPrice:price, chartPreviousClose:open, fiftyTwoWeekHigh:high, fiftyTwoWeekLow:low, currency:cur}}]}};
-        }
-      }
-    }
-  } catch(e) {}
-
-  // Final fallback: try Yahoo via proxies (might work sometimes)
+  // 3. Fallback: Yahoo via CORS proxies
   var url = 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(symbol) + '?interval=1d&range=1d';
   var proxies = [
     'https://api.allorigins.win/raw?url=',
+    'https://corsproxy.io/?',
     'https://api.codetabs.com/v1/proxy?quest='
   ];
   for (var i = 0; i < proxies.length; i++) {
